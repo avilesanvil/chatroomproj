@@ -1,159 +1,153 @@
+/*
+
+	Richard Delforge, Cameron Devenport, Johnny Do
+	Chat Room Project
+	COSC 4333 - Distributed Systems
+	Dr. Sun
+	11/27/2023
+	
+*/
 
 import java.io.*;
 import java.net.*;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class Server {
-    private static volatile boolean isServerRunning = true;
+    private static final int DEFAULT_PORT = 9025;
+    private static final int MAX_PORT = 65535;
+    private static Map<String, Set<PrintWriter>> chatRooms = new ConcurrentHashMap<>();
 
-    static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Server is shutting down...");
-            isServerRunning = false;
-            try {
-                serverSocket.close();
-                for (ClientHandler client : clientHandlers) {
-                    client.closeConnection();
-                }
-            } catch (IOException e) {
-                System.out.println("Error closing server resources: " + e.getMessage());
+    public static void main(String[] args) {
+
+        // Declare and initialize ipAddress and port here
+        String ipAddress = "localhost"; // Default IP address
+        int port = DEFAULT_PORT;        // Default port
+
+        // Update values based on command-line arguments
+        if (args.length > 0) {
+            ipAddress = args[0]; // Get IP address from command-line argument
+            if (args.length > 1) {
+                port = Integer.parseInt(args[1]); // Optional: Get port from command-line argument
             }
-        }));
-    }
-    
-    private static final int WELL_KNOWN_PORT = 9001;
-    private static Map<String, ChatRoom> chatRooms = new ConcurrentHashMap<>();
-    private static List<ClientHandler> clientHandlers = new CopyOnWriteArrayList<>();
-
-    // ChatRoom inner class for managing chat rooms
-    private static class ChatRoom {
-        Set<ClientHandler> members = new HashSet<>();
-
-        public synchronized void addMember(ClientHandler clientHandler, String roomName) {
-            members.add(clientHandler);
-            broadcastMessage("User " + clientHandler.getClientName() + " has joined the chat.", clientHandler);
-            log("User " + clientHandler.getClientName() + " joined room: " + roomName);
         }
 
-        public synchronized void removeMember(ClientHandler clientHandler, String roomName) {
-            members.remove(clientHandler);
-            broadcastMessage("User " + clientHandler.getClientName() + " has left the chat.", clientHandler);
-            log("User " + clientHandler.getClientName() + " left room: " + roomName);
-        }
+        ExecutorService pool = Executors.newFixedThreadPool(10);
 
-        public synchronized void broadcastMessage(String message, ClientHandler sender) {
-            for (ClientHandler member : members) {
-                if (member != sender) {
-                    member.sendMessage(message);
-                }
+        try (ServerSocket serverSocket = new ServerSocket(port, 50, InetAddress.getByName(ipAddress))) {
+            // Print the IP address and port to the console
+            System.out.println("Server is listening on IP: " + serverSocket.getInetAddress().getHostAddress() + " Port: " + serverSocket.getLocalPort());
+
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                pool.execute(new ClientHandler(clientSocket));
             }
+        } catch (IOException ex) {
+            System.out.println("Server exception: " + ex.getMessage());
+            ex.printStackTrace();
         }
     }
 
-    // ClientHandler inner class for handling individual client connections
+    private static int findAvailablePort(int startPort) {
+        while (startPort <= MAX_PORT) {
+            try (ServerSocket serverSocket = new ServerSocket(startPort)) {
+                return startPort;
+            } catch (IOException ignored) {
+                startPort++;
+            }
+        }
+        return -1;
+    }
+
     private static class ClientHandler implements Runnable {
-        private Socket socket;
-        private PrintWriter writer;
-        private BufferedReader reader;
-        private String clientName;
-        private String currentRoom = "";
+        private Socket clientSocket; 
+        private PrintWriter out; 
+        private BufferedReader in; 
+        private String currentRoom; 
+        private String clientName; 
 
         public ClientHandler(Socket socket) {
-            this.socket = socket;
-            try {
-                InputStream input = socket.getInputStream();
-                reader = new BufferedReader(new InputStreamReader(input));
-                OutputStream output = socket.getOutputStream();
-                writer = new PrintWriter(output, true);
-            } catch (IOException e) {
-                log("Error setting up streams: " + e.getMessage());
-            }
+            this.clientSocket = socket;
         }
 
-        @Override
-
-        public void closeConnection() {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                System.out.println("Error closing client connection: " + e.getMessage());
-            }
-        }
-            
         public void run() {
             try {
-                clientName = reader.readLine(); // Read the client name
-                String clientMessage;
-                while ((clientMessage = reader.readLine()) != null) {
-                    if (clientMessage.startsWith("JOIN ")) {
-                        String roomName = clientMessage.substring(5).trim();
-                        leaveRoom(); // Leave the current room if any
-                        joinRoom(roomName);
-                    } else if (clientMessage.equalsIgnoreCase("LEAVE")) {
-                        leaveRoom();
-                        break;
+                out = new PrintWriter(clientSocket.getOutputStream(), true);
+                in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+
+                out.println("Enter your name:");
+                clientName = in.readLine();
+                out.println("Welcome " + clientName + "! You can join a room with JOIN <room_name>, leave with LEAVE, list existing chatrooms with LISTROOMS, or send messages.");
+
+                String inputLine;
+                while ((inputLine = in.readLine()) != null) {
+                    if (inputLine.startsWith("JOIN ")) {
+                        joinChatRoom(inputLine.substring(5));
+                    } else if ("LEAVE".equals(inputLine)) {
+                        leaveChatRoom();
+                    } else if ("LISTROOMS".equals(inputLine)) {
+                        listChatRooms();
                     } else {
-                        // Broadcast the message to all in the current room
-                        if (!currentRoom.isEmpty()) {
-                            chatRooms.get(currentRoom).broadcastMessage(clientName + ": " + clientMessage, this);
-                        }
+                        sendMessageToChatRoom(clientName + ": " + inputLine, this.out);
                     }
                 }
-            } catch (IOException e) {
-                log("Error in ClientHandler: " + e.getMessage());
+            } catch (IOException ex) {
+                System.out.println("Server exception: " + ex.getMessage());
+                ex.printStackTrace();
             } finally {
-                leaveRoom();
-                try {
-                    socket.close();
-                } catch (IOException e) {
-                    log("Error closing socket: " + e.getMessage());
+                leaveChatRoom();
+                closeResources();
+            }
+        }
+
+        private void joinChatRoom(String roomName) {
+            leaveChatRoom();
+            chatRooms.computeIfAbsent(roomName, k -> new HashSet<>()).add(out);
+            currentRoom = roomName;
+            out.println("Entered room: " + roomName);
+            System.out.println(clientName + " has entered chat room: " + roomName);
+        }
+
+        private void leaveChatRoom() {
+            if (currentRoom != null && chatRooms.containsKey(currentRoom)) {
+                chatRooms.get(currentRoom).remove(out);
+                if (chatRooms.get(currentRoom).isEmpty()) {
+                    chatRooms.remove(currentRoom);
+                }
+                out.println("Left room: " + currentRoom);
+                System.out.println(clientName + " has left chat room: " + currentRoom);
+                currentRoom = null;
+            }
+        }
+
+        private void listChatRooms() {
+            out.println("Available chat rooms:");
+            for (Map.Entry<String, Set<PrintWriter>> entry : chatRooms.entrySet()) {
+                out.println(" - " + entry.getKey() + " (" + entry.getValue().size() + " users)");
+            }
+        }
+
+        private void sendMessageToChatRoom(String message, PrintWriter senderOut) {
+            String time = new SimpleDateFormat("HH:mm:ss").format(new Date());
+            String formattedMessage = "\n" + "[" + time + "] " + message.trim();
+            if (currentRoom != null && chatRooms.containsKey(currentRoom)) {
+                for (PrintWriter writer : chatRooms.get(currentRoom)) {
+                    if (writer != senderOut) { 
+                        writer.println(formattedMessage);
+                    }
                 }
             }
         }
 
-        private void joinRoom(String roomName) {
-            currentRoom = roomName;
-            chatRooms.computeIfAbsent(roomName, k -> new ChatRoom()).addMember(this, roomName);
-            log("Client " + clientName + " joined room: " + roomName);
-        }
-
-        private void leaveRoom() {
-            if (!currentRoom.isEmpty() && chatRooms.containsKey(currentRoom)) {
-                chatRooms.get(currentRoom).removeMember(this, currentRoom);
-                log("Client " + clientName + " left room: " + currentRoom);
-                currentRoom = "";
+        private void closeResources() {
+            try {
+                if (out != null) out.close();
+                if (in != null) in.close();
+                if (clientSocket != null) clientSocket.close();
+            } catch (IOException ex) {
+                ex.printStackTrace();
             }
         }
-
-        public void sendMessage(String message) {
-            writer.println(message);
-        }
-
-        public String getClientName() {
-            return clientName;
-        }
-    }
-
-    // Main method to start the server
-    public static void main(String[] args) {
-        try (ServerSocket serverSocket = new ServerSocket(WELL_KNOWN_PORT)) {
-            log("Server started on port " + WELL_KNOWN_PORT);
-
-            while (isServerRunning) {
-                Socket clientSocket = serverSocket.accept();
-                ClientHandler clientHandler = new ClientHandler(clientSocket);
-                clientHandlers.add(clientHandler);
-                new Thread(clientHandler).start();
-            }
-
-        } catch (IOException e) {
-            log("Server exception: " + e.getMessage());
-        }
-    }
-
-    // Simple logging method
-    private static void log(String message) {
-        System.out.println("[Server]: " + message);
     }
 }
